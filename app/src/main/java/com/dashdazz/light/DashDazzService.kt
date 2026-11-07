@@ -66,6 +66,7 @@ class DashDazzService : Service() {
         const val ACTION_UPDATE = "com.dashdazz.light.action.UPDATE"
         const val ACTION_PULSE = "com.dashdazz.light.action.PULSE"
         const val ACTION_ACTIVATE = "com.dashdazz.light.action.ACTIVATE"
+        const val ACTION_MONITOR = "com.dashdazz.light.action.MONITOR"
 
         const val EXTRA_MODE = "extra_mode"
         const val EXTRA_COLOR = "extra_color"
@@ -228,11 +229,42 @@ class DashDazzService : Service() {
             }
         }
 
+        fun setFlashScreen(context: Context, enabled: Boolean) {
+            Prefs.setFlashScreen(context, enabled)
+            val svc = activeService
+            if (enabled && svc == null) {
+                ensureAutomationMonitor(context)
+            } else if (!enabled && svc != null && !_stateFlow.value.isRunning && !svc.needsAutomationMonitor()) {
+                svc.stopLight()
+            }
+        }
+
         fun setAutoCharging(context: Context, enabled: Boolean) {
             Prefs.setAutoCharging(context, enabled)
             val svc = activeService
             if (!enabled && svc != null && svc.autoChargeActive) {
                 svc.exitChargingMode()
+            } else if (enabled && svc == null) {
+                ensureAutomationMonitor(context)
+            } else if (!enabled && svc != null && !_stateFlow.value.isRunning && !svc.needsAutomationMonitor()) {
+                svc.stopLight()
+            }
+        }
+
+        fun ensureAutomationMonitor(context: Context) {
+            if (activeService != null) return
+            if (!Prefs.isFlashScreen(context) && !Prefs.isAutoCharging(context)) return
+            val intent = Intent(context, DashDazzService::class.java).apply {
+                action = ACTION_MONITOR
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "Automation monitor start deferred: ${e.message}")
             }
         }
 
@@ -315,6 +347,14 @@ class DashDazzService : Service() {
             }
 
             val target = activeService
+            (context.getSystemService(android.os.PowerManager::class.java)?.isInteractive)?.let {
+                screenInteractiveFlag = it
+            }
+            if (newScreenMode != SCREEN_NOTIF_ONLY && target?.notifOwnedRun == true) {
+                target.activateGen++
+                target.activateJob?.cancel()
+                target.notifOwnedRun = false
+            }
             if (modeChanged) {
                 target?.let { if (it.autoChargeActive) it.autoChargeActive = false }
                 if (current.chargingIndicator) {
@@ -543,7 +583,14 @@ class DashDazzService : Service() {
         }
 
         scope.launch {
-            runCatching { LightsBridge.turnOff() }
+            // Only blank the ring when nothing has claimed it yet. On a cold start
+            // driven by a START/PULSE intent the animation may already be running,
+            // and an unconditional turnOff would race with (and wipe) its first frames.
+            animationMutex.withLock {
+                if (job?.isActive != true && pulseJob?.isActive != true && !_stateFlow.value.isRunning) {
+                    runCatching { LightsBridge.turnOff() }
+                }
+            }
         }
 
         val filter = IntentFilter().apply {
@@ -569,8 +616,20 @@ class DashDazzService : Service() {
 
         when (action) {
             ACTION_STOP -> {
-                stopLight()
-                return START_NOT_STICKY
+                stopLight(keepMonitorIfConfigured = true)
+                return if (needsAutomationMonitor()) START_STICKY else START_NOT_STICKY
+            }
+            ACTION_MONITOR -> {
+                if (!_stateFlow.value.isRunning && !needsAutomationMonitor()) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                startAsForeground()
+                rebindNotificationListener()
+                scope.launch {
+                    runCatching { LightsBridge.ensureBackgroundSurvival(packageName) }
+                }
+                return START_STICKY
             }
             ACTION_PULSE -> {
                 val force = intent?.getBooleanExtra(EXTRA_FORCE, false) ?: false
@@ -619,6 +678,14 @@ class DashDazzService : Service() {
                 val wasRunning = _stateFlow.value.isRunning
                 val modeChanged = (newMode != _stateFlow.value.mode)
                 val dualStyleChanged = (newDualStyle != _stateFlow.value.dualStyle)
+                (getSystemService(android.os.PowerManager::class.java)?.isInteractive)?.let {
+                    screenInteractiveFlag = it
+                }
+                if (newScreenMode != SCREEN_NOTIF_ONLY && notifOwnedRun) {
+                    activateGen++
+                    activateJob?.cancel()
+                    notifOwnedRun = false
+                }
 
                 Prefs.saveAll(
                     this, _stateFlow.value.copy(
@@ -685,14 +752,27 @@ class DashDazzService : Service() {
         return START_STICKY
     }
 
+    internal fun needsAutomationMonitor(): Boolean =
+        Prefs.isFlashScreen(this) || Prefs.isAutoCharging(this)
+
     private fun stopIfNotForeground() {
-        if (!_stateFlow.value.isRunning) {
+        if (!_stateFlow.value.isRunning && !needsAutomationMonitor()) {
             stopSelf()
         }
     }
 
     private fun recoverStickyRestart() {
-        if (!_stateFlow.value.isRunning) return
+        (getSystemService(android.os.PowerManager::class.java)?.isInteractive)?.let {
+            screenInteractiveFlag = it
+        }
+        if (!_stateFlow.value.isRunning) {
+            if (needsAutomationMonitor()) {
+                Log.d(TAG, "Sticky restart with no intent: restoring automation monitor")
+                runCatching { startAsForeground() }
+                rebindNotificationListener()
+            }
+            return
+        }
         Log.d(TAG, "Sticky restart with no intent: restoring foreground and animation")
         runCatching { startAsForeground() }
         rebindNotificationListener()
@@ -722,10 +802,19 @@ class DashDazzService : Service() {
 
     private fun rebindNotificationListener() {
         try {
+            if (DashDazzNotificationListener.isConnected) return
             if (!DashDazzNotificationListener.isNotificationAccessGranted(this)) return
-            android.service.notification.NotificationListenerService.requestRebind(
-                ComponentName(this, DashDazzNotificationListener::class.java)
-            )
+            val cn = ComponentName(this, DashDazzNotificationListener::class.java)
+            android.service.notification.NotificationListenerService.requestRebind(cn)
+            if (LightsBridge.isRootAvailable()) {
+                ioScope.launch {
+                    delay(500)
+                    if (!DashDazzNotificationListener.isConnected) {
+                        val flat = cn.flattenToString()
+                        LightsBridge.runRoot("cmd notification allow_listener $flat")
+                    }
+                }
+            }
         } catch (e: Throwable) {
             Log.d(TAG, "Listener rebind ignored: ${e.message}")
         }
@@ -1371,6 +1460,12 @@ class DashDazzService : Service() {
                     job = null
                 }
 
+                // The LED driver is left in effect=0 / disabled after hardwareOff(), so
+                // colour writes alone are invisible (flash on lock/unlock, notif-only).
+                // Re-arm the global effect before drawing the pulse.
+                LightsBridge.resetHardwareToGlobal()
+                LightsBridge.resetScene()
+
                 val hsv = FloatArray(3)
                 Color.colorToHSV(pulseColor, hsv)
                 val maxBright = _stateFlow.value.brightness.coerceIn(0.1f, 1f)
@@ -1435,7 +1530,13 @@ class DashDazzService : Service() {
                             else -> {
                                 LightsBridge.turnOff()
                                 notifOwnedRun = false
-                                stopLight()
+                                if (needsAutomationMonitor()) {
+                                    _stateFlow.update { it.copy(isRunning = false, isScreenPaused = false) }
+                                    updateNotificationText()
+                                    notifyTileState(this@DashDazzService)
+                                } else {
+                                    stopLight()
+                                }
                             }
                         }
                     }
@@ -1534,10 +1635,35 @@ class DashDazzService : Service() {
                 withContext(NonCancellable) {
                     animationMutex.withLock {
                         if (gen != activateGen) return@withLock
-                        if (isNotifOnlyMode) Log.d(TAG, "Notif Only activation window ended")
-                        Log.d(TAG, "Notification activate duration expired, stopping")
-                        notifOwnedRun = false
-                        stopLight()
+                        if (isNotifOnlyMode) {
+                            Log.d(TAG, "Notif Only activation window ended, returning to standby")
+                            job?.cancelAndJoin()
+                            job = null
+                            AudioReactiveEngine.stop()
+                            withContext(NonCancellable) {
+                                LightsBridge.turnOff()
+                            }
+                            notifOwnedRun = false
+                            _stateFlow.update { it.copy(isRunning = true, isScreenPaused = true) }
+                            updateNotificationText()
+                            notifyTileState(this@DashDazzService)
+                        } else {
+                            Log.d(TAG, "Notification activate duration expired, stopping")
+                            notifOwnedRun = false
+                            if (needsAutomationMonitor()) {
+                                job?.cancelAndJoin()
+                                job = null
+                                AudioReactiveEngine.stop()
+                                withContext(NonCancellable) {
+                                    LightsBridge.turnOff()
+                                }
+                                _stateFlow.update { it.copy(isRunning = false, isScreenPaused = false) }
+                                updateNotificationText()
+                                notifyTileState(this@DashDazzService)
+                            } else {
+                                stopLight()
+                            }
+                        }
                     }
                 }
             }
@@ -1574,7 +1700,23 @@ class DashDazzService : Service() {
         _stateFlow.update { it.copy(chargingIndicator = false) }
         if (startedByUs) {
             Log.d(TAG, "Charging indicator ended: stopping the light we started")
-            stopLight()
+            if (needsAutomationMonitor()) {
+                scope.launch {
+                    animationMutex.withLock {
+                        job?.cancelAndJoin()
+                        job = null
+                        AudioReactiveEngine.stop()
+                        withContext(NonCancellable) {
+                            LightsBridge.turnOff()
+                        }
+                    }
+                }
+                _stateFlow.update { it.copy(isRunning = false, isScreenPaused = false) }
+                updateNotificationText()
+                notifyTileState(this)
+            } else {
+                stopLight()
+            }
         } else {
             Log.d(TAG, "Charging indicator ended: restoring the configured mode")
             evaluateScreenPolicy()
@@ -1584,7 +1726,7 @@ class DashDazzService : Service() {
     internal fun stillRunning(): Boolean =
         _stateFlow.value.isRunning && !_stateFlow.value.isScreenPaused
 
-    private fun stopLight() {
+    private fun stopLight(keepMonitorIfConfigured: Boolean = false) {
         pulseGen++
         activateGen++
         notifOwnedRun = false
@@ -1604,8 +1746,10 @@ class DashDazzService : Service() {
         _stateFlow.update { it.copy(isRunning = false, isScreenPaused = false) }
         updateNotificationText()
         notifyTileState(this)
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        if (!keepMonitorIfConfigured || !needsAutomationMonitor()) {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -1698,7 +1842,9 @@ class DashDazzService : Service() {
         val activateLabel = getString(R.string.notif_activate_running)
         val baseText = if (activateJob?.isActive == true) "$activateLabel: $labelledMode" else labelledMode
 
-        val contentText = if (state.isScreenPaused) {
+        val contentText = if (!state.isRunning) {
+            getString(R.string.title_features)
+        } else if (state.isScreenPaused) {
             if (state.screenMode == SCREEN_NOTIF_ONLY) {
                 getString(R.string.notification_notif_only)
             } else {
@@ -1708,18 +1854,20 @@ class DashDazzService : Service() {
             baseText
         }
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
             .setContentText(contentText)
             .setSmallIcon(R.drawable.ic_qs_camera_ring)
             .setContentIntent(openActivityPendingIntent)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .addAction(
+        if (state.isRunning) {
+            builder.addAction(
                 0,
                 getString(R.string.action_turn_off),
                 stopPendingIntent
             )
-            .build()
+        }
+        return builder.build()
     }
 }

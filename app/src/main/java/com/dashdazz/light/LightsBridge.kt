@@ -194,7 +194,24 @@ object LightsBridge {
         var ok = true
         ok = runRoot("cmd deviceidle whitelist +$packageName") && ok
         ok = runRoot("am set-standby-bucket $packageName active") && ok
-        ok = runRoot("cmd appops set $packageName AUTO_START allow") && ok
+        // Allow background run and MIUI/HyperOS autostart (op 10008 on HyperOS, AUTO_START on older MIUI)
+        runRoot("cmd appops set $packageName RUN_IN_BACKGROUND allow")
+        runRoot("cmd appops set $packageName RUN_ANY_IN_BACKGROUND allow")
+        runRoot("cmd appops set $packageName 10008 allow 2>/dev/null || true")
+        runRoot("cmd appops set $packageName AUTO_START allow 2>/dev/null || true")
+        // If Brevent is active on the device, remove our package from its force-stop list
+        // and restart brevent_server so it reloads the clean list from disk.
+        runRoot(
+            "nsenter -t 1 -m -- sh -c '" +
+                "changed=0; " +
+                "for f in /data/user_de/0/com.android.shell/me.piebridge.brevent.list " +
+                "/data/user_de/0/com.android.shell/me.piebridge.brevent.appops; do " +
+                "if [ -f \"\$f\" ] && grep -qx \"$packageName\" \"\$f\"; then " +
+                "sed -i \"/^$packageName\$/d\" \"\$f\"; changed=1; " +
+                "fi; done; " +
+                "if [ \"\$changed\" = 1 ]; then killall brevent_server 2>/dev/null || true; fi" +
+                "' 2>/dev/null || true"
+        )
         if (ok) Log.d(TAG, "Background survival protection applied")
         return ok
     }
@@ -319,6 +336,8 @@ object LightsBridge {
 
     fun setHardwareBreath(r: Int, g: Int, b: Int): Boolean = synchronized(hwLock) {
         val cmd = "SYS=\"$SYS_REG\"; " +
+                "echo 1 > \"$SYS_HWEN\" && " +
+                "echo 2 > \"$SYS_EFFECT\" && " +
                 "echo '0xa1 0x00' > \"\$SYS\" && " +
                 "echo '0x00 0x11' > \"\$SYS\" && " +
                 "echo '0x6e 0xff' > \"\$SYS\" && " +

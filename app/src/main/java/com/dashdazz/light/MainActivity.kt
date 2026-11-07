@@ -104,10 +104,12 @@ class MainActivity : ComponentActivity() {
         checkNotificationPermission()
 
         checkRootStatusAsync()
+        DashDazzService.ensureAutomationMonitor(this)
         Thread {
             if (!DashDazzService.isRunning) {
                 runCatching { LightsBridge.turnOff() }
             }
+            runCatching { LightsBridge.ensureBackgroundSurvival(packageName) }
         }.start()
 
         setContent {
@@ -2218,7 +2220,7 @@ fun DashDazzScreen(
                                 checked = flashScreen,
                                 onCheckedChange = {
                                     flashScreen = it
-                                    Prefs.setFlashScreen(context, it)
+                                    DashDazzService.setFlashScreen(context, it)
                                 }
                             )
                             SuperSwitch(

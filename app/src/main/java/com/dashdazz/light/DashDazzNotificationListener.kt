@@ -106,6 +106,13 @@ class DashDazzNotificationListener : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        isConnected = true
+        DashDazzService.ensureAutomationMonitor(this)
+        if (listenerScope.isActive) {
+            listenerScope.launch {
+                runCatching { LightsBridge.ensureBackgroundSurvival(packageName) }
+            }
+        }
         try {
             val msm = getSystemService(MediaSessionManager::class.java)
             val component = ComponentName(this, DashDazzNotificationListener::class.java)
@@ -124,6 +131,7 @@ class DashDazzNotificationListener : NotificationListenerService() {
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
+        isConnected = false
         mediaReclaimJob?.cancel()
         mediaReclaimJob = null
         mediaWasPlaying = false
@@ -181,6 +189,7 @@ class DashDazzNotificationListener : NotificationListenerService() {
     }
 
     override fun onDestroy() {
+        isConnected = false
         try {
             val msm = getSystemService(MediaSessionManager::class.java)
             msm?.removeOnActiveSessionsChangedListener(mediaSessionListener)
@@ -199,6 +208,10 @@ class DashDazzNotificationListener : NotificationListenerService() {
         private const val TAG = "DashDazzNotif"
 
         private val RECLAIM_OFFSETS_MS = listOf(500L, 1500L, 3000L, 5000L, 8000L)
+
+        @Volatile
+        var isConnected: Boolean = false
+            internal set
 
         @Volatile
         var playingPackages: Set<String> = emptySet()
